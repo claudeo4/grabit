@@ -136,7 +136,7 @@ function paint(){const L=info[mode];$$('.tile').forEach(b=>{const t=L.find(x=>x.
  const t=L.find(x=>x.id==sel);if(!t)return;const d=t.full-t.size;$('#gosz').textContent=fmt(saver?t.size:t.full);$('#go').disabled=false;$('#gain').hidden=!(saver&&t.size&&d>=5e6);$('#gain').textContent='Saves '+fmt(d)}
 function setP(p){$('#ring').style.strokeDashoffset=603.2*(1-p/100);$('#pct').firstChild.nodeValue=Math.round(p)}
 async function start(){const t=info&&info[mode].find(x=>x.id==sel);if(!t)return home();if(info.playlist)return startJob(t);
- const b=$('#go');b.disabled=true;$('#gosz').textContent='Preparing';
+ const b=$('#go');b.disabled=true;$('#gosz').textContent='…';
  try{const {token,name}=await api('/api/prepare',{url,quality:sel,saver});
   const a=document.createElement('a');a.href='/api/stream/'+token;a.download=name;a.hidden=true;document.body.append(a);a.click();a.remove();
   $('#pt').textContent=info.title;setP(100);show('done');$('#save').hidden=true;$('#hint').textContent='Downloading in Chrome';
