@@ -1,59 +1,75 @@
-import asyncio, gzip, hashlib, ipaddress, json, logging, os, re, shutil, signal, socket, subprocess, sys, tempfile, threading, time, uuid, zipfile
+import asyncio, ipaddress, logging, os, re, shutil, socket, subprocess, sys, tempfile, threading, time, uuid, zipfile
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
+from email.utils import formatdate
 from pathlib import Path
 from urllib.parse import quote, urlparse
 
 import yt_dlp
-from yt_dlp.utils import DownloadCancelled
-from fastapi import FastAPI, HTTPException, Request, Response
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+import yt_dlp.version
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse, Response, StreamingResponse
 from pydantic import BaseModel, Field
 
 MAX_MB = int(os.getenv("MAX_FILE_MB", 500))
 MAX_MIN = int(os.getenv("MAX_DURATION_MIN", 60))
-RATE = int(os.getenv("RATE_LIMIT", 20))          # info/download POSTs per minute per IP
-SLOTS = int(os.getenv("MAX_PARALLEL", 2))        # simultaneous downloads (others queue)
-GENERIC = os.getenv("ALLOW_GENERIC", "0") == "1"  # arbitrary-URL extractor (SSRF risk), off by default
-AUTO_UPDATE = os.getenv("AUTO_UPDATE", "1") == "1"
-TTL = 600
+RATE = int(os.getenv("RATE_LIMIT", 5))  # POST requests per minute per IP
+MAX_JOBS = int(os.getenv("MAX_JOBS", 2))  # downloads running at the same time (phone-friendly)
+MIN_FREE_MB = 300  # refuse new downloads when the phone has less free space
+TTL = 600  # delete finished files 10 min after their last use
+ABANDON = 600  # stop a running job if the page stopped checking in for 10 min
 HERE = Path(__file__).parent
 ROOT = Path(tempfile.gettempdir()) / "grabit"
-shutil.rmtree(ROOT, ignore_errors=True)  # orphans from a previous run
-ROOT.mkdir(parents=True)
+shutil.rmtree(ROOT, ignore_errors=True)  # leftovers from a previous run eat phone storage
+ROOT.mkdir(parents=True, exist_ok=True)
 JOBS: dict = {}
-KEYS: dict = {}   # (url, quality, playlist, saver) -> job id, so repeat requests reuse the same file
-INFO: dict = {}   # url -> (time, result), spares the origin site repeated lookups
-RAW: dict = {}    # url -> (time, formats), so /api/prepare doesn't re-fetch what /api/info just got
-STREAMS: dict = {}  # one-shot tickets for direct-to-Chrome streaming
 HITS: dict = defaultdict(deque)
-SLOT = threading.BoundedSemaphore(SLOTS)
+SLOTS = threading.BoundedSemaphore(MAX_JOBS)
 log = logging.getLogger("grabit")
-BASE = dict(quiet=True, no_warnings=True, noprogress=True, socket_timeout=15, retries=3, fragment_retries=5, cachedir=False,
-            allowed_extractors=["default"] if GENERIC else ["default", "-generic"])
+BASE = dict(quiet=True, no_warnings=True, socket_timeout=15, retries=2)
+MIME = {".mp4": "video/mp4", ".webm": "video/webm", ".mkv": "video/x-matroska", ".mp3": "audio/mpeg",
+        ".m4a": "audio/mp4", ".zip": "application/zip"}
 
 
 class Req(BaseModel):
     url: str = Field(max_length=2048)
-    quality: str = "v720"
+    quality: str = Field("v720", max_length=10)
     playlist: bool = False
-    saver: bool = True
 
 
 class UserError(Exception):
     pass
 
 
+class Stop(yt_dlp.utils.DownloadCancelled):
+    """Raised inside yt-dlp's progress hook to stop a job (cancel, too big, abandoned)."""
+
+
 ERRORS = [
-    (("drm",), "This video is DRM-protected and can't be downloaded."),
+    (("drm",), "This video is DRM-protected. GrabIt can't download it."),
     (("unsupported url",), "This site isn't supported."),
-    (("not a bot",), "The site blocked this server. Try again later."),
-    (("confirm your age", "age-restricted", "age restricted"), "This video is age-restricted."),
-    (("not available in your country", "geo-restrict", "geo restrict", "blocked it in your", "blocked in your"), "This video is blocked in the server's region."),
-    (("sign in", "log in", "login required"), "This video needs a login."),
-    (("private",), "This video is private."),
+    (("confirm your age", "age-restricted", "age restricted"), "This video is age-restricted and can't be downloaded."),
+    (("not available in your country", "geo-restrict", "geo restrict", "blocked it in your"),
+     "This video is geo-blocked in the server's region."),
+    (("not a bot",), "The site blocked this server (bot check). Try another video or host."),
+    (("sign in", "log in", "login required"), "This video needs a login, so GrabIt can't download it."),
+    (("private video", "is private"), "This video is private."),
+    (("requested format is not available",), "That quality isn't available for this video. Pick another one."),
+    (("ffmpeg", "ffprobe"), "ffmpeg is missing or failed. In Termux run: pkg install ffmpeg"),
+    (("no space left",), "The phone is out of storage. Free some space and try again."),
+    (("http error 429", "too many requests"), "The site is rate-limiting this server. Wait a few minutes and try again."),
+    (("timed out", "timeout", "urlopen error", "connection reset", "network is unreachable"),
+     "Network problem while reaching the site. Check the phone's internet and try again."),
     (("unavailable", "removed", "does not exist", "404"), "This video was removed or is unavailable."),
 ]
+
+
+def detail(e):
+    """Short, readable yt-dlp error text. Links are masked so they never reach logs or the UI."""
+    s = re.sub(r"\x1b\[[0-9;]*m", "", str(e)).strip()
+    s = re.sub(r"^(ERROR:\s*)+", "", s)
+    s = re.sub(r"https?://\S+", "<link>", s)
+    return s[:200]
 
 
 def friendly(e):
@@ -61,17 +77,22 @@ def friendly(e):
     for keys, msg in ERRORS:
         if any(k in m for k in keys):
             return msg
-    return "Couldn't process that link."
+    d = detail(e)
+    return f"Couldn't process that link: {d}" if d else "Couldn't process that link. Check it and try again."
 
 
 def check_url(u):
     u = u.strip()
     p = urlparse(u)
     if p.scheme not in ("http", "https") or not p.hostname:
-        raise UserError("Enter a valid http(s) link.")
+        raise UserError("Please enter a valid http(s) link.")
     try:
-        for i in socket.getaddrinfo(p.hostname, p.port or 80):
-            if not ipaddress.ip_address(i[4][0].split("%")[0]).is_global:
+        port = p.port
+    except ValueError:
+        raise UserError("That link has an invalid port number.")
+    try:
+        for i in socket.getaddrinfo(p.hostname, port or 80):
+            if not ipaddress.ip_address(i[4][0]).is_global:
                 raise UserError("That address isn't allowed.")
     except (socket.gaierror, ValueError):
         raise UserError("Couldn't find that website.")
@@ -79,241 +100,198 @@ def check_url(u):
 
 
 def safe(t):
-    return re.sub(r'[\\/:*?"<>|\x00-\x1f]', "", t).strip(" .")[:100] or "video"
+    t = re.sub(r'[\\/:*?"<>|\x00-\x1f\u200e\u200f\u202a-\u202e\u2066-\u2069]', "", t).strip(" .")
+    t = t.encode("utf-8")[:120].decode("utf-8", "ignore")  # Android allows 255 bytes; Arabic/emoji use 2-4 per char
+    return t.strip(" .") or "video"
 
 
-# ---------- format selection (shared by size estimates and the real download) ----------
-def has(f, k):
-    return f.get(k) not in (None, "none")
-
-
-def res(f):  # "720p" means the short side, so vertical videos (Shorts/Reels) are labelled correctly
-    h = f.get("height") or 0
-    return min(h, f.get("width") or h)
+def it(id_, label, size=0):
+    return {"id": id_, "label": label, "size": size, "disabled": size > MAX_MB * 1_000_000}
 
 
 def est(f, dur):
-    return (f.get("filesize") or f.get("filesize_approx") or int((f.get("tbr") or 0) * 125 * dur)) if f else 0
-
-
-def pick_a(auds, saver):
-    if not auds:
-        return None
-    c = [f for f in auds if (f.get("abr") or 0) <= 132] if saver else auds  # >128k audio is wasted data on phones
-    c = c or [min(auds, key=lambda f: f.get("abr") or 0)]
-    return min(c, key=lambda f: (-(f.get("language_preference") or 0), f.get("ext") != "m4a", -(f.get("abr") or 0)))
-
-
-def pick(fm, h, saver):
-    ok = [f for f in fm if f.get("has_drm") is not True]
-    vids = [f for f in ok if has(f, "vcodec") and f.get("height")]
-    if not vids:
-        return None, None
-    pool = [f for f in vids if res(f) <= h] or [min(vids, key=res)]
-    top = max(res(f) for f in pool)
-    c = [f for f in pool if res(f) == top]
-    fps = lambda f: -(f.get("fps") or 0)
-    if saver:  # same resolution + fps, smallest encode (AV1/VP9 beat H.264 by 30-50%)
-        v = min(c, key=lambda f: (fps(f), f.get("tbr") or 1e9))
-    else:      # widest compatibility: H.264 first
-        v = min(c, key=lambda f: (fps(f), not str(f.get("vcodec")).startswith("avc1"), -(f.get("tbr") or 0)))
-    a = None
-    if not has(v, "acodec"):
-        a = pick_a([f for f in ok if f.get("vcodec") == "none" and has(f, "acodec")], saver)
-    return v, a
-
-
-def selector(q, saver):
-    def sel(ctx):
-        fm = ctx["formats"]
-        if q[0] == "v":
-            v, a = pick(fm, int(q[1:]), saver)
-        else:
-            v, a = pick_a([f for f in fm if f.get("vcodec") == "none" and has(f, "acodec")], saver), None
-        if not v:
-            if fm:
-                yield fm[-1]
-        elif a:
-            yield {"format_id": f"{v['format_id']}+{a['format_id']}", "ext": "mp4", "requested_formats": [v, a],
-                   "protocol": f"{v.get('protocol')}+{a.get('protocol')}"}
-        else:
-            yield v
-    return sel
-
-
-def thumb(i):
-    ts = sorted((t for t in i.get("thumbnails") or [] if t.get("url") and t.get("width")), key=lambda t: t["width"])
-    t = next((t for t in ts if t["width"] >= 320), ts[-1] if ts else None)  # smallest sharp-enough image
-    return t["url"] if t else i.get("thumbnail")
-
-
-def tile(id_, label, size=0, full=0):
-    return {"id": id_, "label": label, "size": size, "full": full or size,
-            "disabled": bool(size) and min(size, full or size) > MAX_MB * 1_000_000}
+    if not f:
+        return 0
+    s = f.get("filesize") or f.get("filesize_approx") or 0
+    if not s and dur and f.get("tbr"):
+        s = f["tbr"] * 125 * dur  # kbit/s -> bytes
+    return int(s)
 
 
 def get_info(r):
     url = check_url(r.url)
-    hit = INFO.get(url)
-    if hit and time.time() - hit[0] < 300:
-        return hit[1]
     try:
-        with yt_dlp.YoutubeDL({**BASE, "noplaylist": True, "extract_flat": "in_playlist", "playlistend": 10}) as y:
+        with yt_dlp.YoutubeDL({**BASE, "noplaylist": not r.playlist, "extract_flat": "in_playlist", "playlistend": 10}) as y:
             i = y.extract_info(url, download=False)
     except Exception as e:
-        log.warning("info failed: %s", e)
+        log.warning("info failed (%s)", type(e).__name__)
         raise UserError(friendly(e))
     if not i:
-        raise UserError("Couldn't process that link.")
-    if i.get("_type") == "playlist":
+        raise UserError("Nothing was found at that link.")
+    if i.get("_type") in ("playlist", "multi_video"):
+        if not r.playlist:
+            raise UserError("This link is a playlist. Tick “Download playlist” and analyze again.")
         es = [e for e in (i.get("entries") or []) if e][:10]
-        if not es:
-            raise UserError("This playlist is empty.")
-        out = {"title": i.get("title") or "Playlist", "thumb": next((thumb(e) for e in es if e.get("thumbnails")), None),
-               "dur": 0, "by": i.get("uploader"), "playlist": True, "count": len(es),
-               "video": [tile(f"v{h}", f"{h}p") for h in (1080, 720, 480, 360)],
-               "audio": [tile("m4a", "M4A"), tile("mp3", "MP3")]}
-    else:
-        if i.get("is_live"):
-            raise UserError("Live streams aren't supported.")
-        dur = i.get("duration") or 0
-        if dur > MAX_MIN * 60:
-            raise UserError(f"Videos over {MAX_MIN} minutes aren't supported.")
-        fm = [f for f in (i.get("formats") or []) if f.get("has_drm") is not True]
-        if i.get("formats") and not fm:
-            raise UserError(friendly("drm"))
-        top = max((res(f) for f in fm if has(f, "vcodec") and f.get("height")), default=0)
-        RAW[url] = (time.time(), {"title": i.get("title") or "video", "fm": fm})
-        V, seen = [], set()
-        for h in (2160, 1440, 1080, 720, 480, 360, 240):
-            if top < h:
-                continue
-            v, a = pick(fm, h, True)
-            if not v or v["format_id"] in seen:
-                continue
-            seen.add(v["format_id"])
-            v2, a2 = pick(fm, h, False)
-            V.append(tile(f"v{h}", f"{h}p", est(v, dur) + est(a, dur), est(v2, dur) + est(a2, dur)))
-        auds = [f for f in fm if f.get("vcodec") == "none" and has(f, "acodec")]
-        m4 = lambda s: est(pick_a([f for f in auds if f.get("ext") == "m4a"] or auds, s), dur)
-        out = {"title": i.get("title") or "Video", "thumb": thumb(i), "dur": dur, "by": i.get("uploader") or i.get("channel"),
-               "playlist": False, "count": 0, "video": V,
-               "audio": [tile("m4a", "M4A", m4(True), m4(False)), tile("mp3", "MP3", int(dur * 16000), int(dur * 24000))]}
-    INFO[url] = (time.time(), out)
-    return out
+        thumb = next((e["thumbnails"][-1]["url"] for e in es if e.get("thumbnails")), None)
+        groups = [
+            {"name": "Video", "items": [it(f"v{h}", f"{h}p") for h in (1080, 720, 480, 360)]},
+            {"name": "Audio only", "items": [it("mp3", "MP3"), it("m4a", "M4A")]},
+            {"name": "Best available", "items": [it("best", "Best")]},
+        ]
+        return {"title": i.get("title") or "Playlist", "thumbnail": thumb, "duration": 0,
+                "uploader": i.get("uploader"), "playlist_count": len(es), "groups": groups}
+    if i.get("is_live"):
+        raise UserError("Live streams aren't supported.")
+    dur = i.get("duration") or 0
+    if dur > MAX_MIN * 60:
+        raise UserError(f"This video is longer than the {MAX_MIN}-minute limit.")
+    fm = i.get("formats") or []
+    ok = [f for f in fm if f.get("has_drm") is not True]
+    if fm and not ok:
+        raise UserError(friendly("drm"))
+    vids = [f for f in ok if f.get("vcodec") not in (None, "none") and f.get("height")]
+    auds = [f for f in ok if f.get("vcodec") == "none" and f.get("acodec") not in (None, "none")]
+    ab = max(auds, key=lambda f: f.get("abr") or 0, default=None)
+    m4 = max((f for f in auds if f.get("ext") == "m4a"), key=lambda f: f.get("abr") or 0, default=None)
+    top = max((f["height"] for f in vids), default=0)
+    V = []
+    for h in (2160, 1440, 1080, 720, 480, 360, 240, 144):
+        c = [f for f in vids if f["height"] <= h]
+        if top >= h and c:
+            b = max(c, key=lambda f: (f["height"], f.get("tbr") or 0))
+            extra = 0 if b.get("acodec") not in (None, "none") else est(ab, dur)
+            V.append(it(f"v{h}", f"{h}p", est(b, dur) + extra))
+    groups = [
+        {"name": "Video", "items": V},
+        {"name": "Audio only", "items": [it("mp3", "MP3 192k", int(dur * 24000)), it("m4a", "M4A", est(m4, dur) or est(ab, dur))]},
+        {"name": "Best available", "items": [it("best", "Best", V[0]["size"] if V else est(ab, dur))]},
+    ]
+    return {"title": i.get("title") or "Video", "thumbnail": i.get("thumbnail"), "duration": dur,
+            "uploader": i.get("uploader") or i.get("channel"), "playlist_count": 0, "groups": groups}
 
 
-# ---------- download ----------
-def work(jid, url, r):
+def run(jid, url, r):
     J = JOBS[jid]
     d = J["dir"]
-    d.mkdir(exist_ok=True)
-    q, done = r.quality, [0]
+    q = r.quality
+    limit = MAX_MB * 1_000_000
+    done = [0]  # finished streams
+    base = [0]  # bytes of finished streams
+    got_slot = False
+
+    def stop(msg):
+        J["abort"] = J.get("abort") or msg
+        raise Stop()
 
     def hook(h):
         if J.get("cancel"):
-            raise DownloadCancelled("cancelled")
-        inf = h.get("info_dict") or {}
+            stop("Cancelled.")
+        got = h.get("downloaded_bytes") or 0
         if h["status"] == "finished":
             done[0] += 1
+            base[0] += got
             return
+        if base[0] + got > limit:
+            stop(f"This download would be larger than the {MAX_MB} MB limit.")
+        inf = h.get("info_dict") or {}
         n = min(inf.get("n_entries") or 1, 10)
         per = len(inf.get("requested_formats") or [1])
         tot = h.get("total_bytes") or h.get("total_bytes_estimate") or 0
-        frac = (h.get("downloaded_bytes") or 0) / tot if tot else 0
-        J.update(status="downloading", percent=round(min(99, (done[0] + frac) / (per * n) * 100), 1),
+        if tot:
+            frac = got / tot
+        elif h.get("fragment_count"):
+            frac = (h.get("fragment_index") or 0) / h["fragment_count"]
+        else:
+            frac = 0
+        pct = min(99, (done[0] + min(frac, 1)) / (per * n) * 100)
+        J.update(status="downloading", percent=round(max(J.get("percent") or 0, pct), 1),
                  speed=h.get("speed"), eta=h.get("eta"))
 
     def pp(h):
         if h["status"] == "started":
             J.update(status="processing", percent=99)
 
-    opts = {**BASE, "noplaylist": not r.playlist, "playlistend": 10, "format": selector(q, r.saver),
-            "outtmpl": str(d / "%(title).80B.%(ext)s"), "restrictfilenames": True,
-            "max_filesize": MAX_MB * 1_000_000, "merge_output_format": "mp4",
+    # H.264/AAC is preferred inside the same resolution so the MP4 plays on every phone.
+    fmt = {"best": "bv*+ba/b", "mp3": "bestaudio/best", "m4a": "bestaudio[ext=m4a]/bestaudio/best"}.get(
+        q) or f"bv*[height<=?{q[1:]}]+ba/b[height<=?{q[1:]}]"
+    opts = {**BASE, "noplaylist": not r.playlist, "playlistend": 10, "format": fmt,
+            "format_sort": ["res", "vcodec:h264", "acodec:m4a"],
+            "outtmpl": str(d / "%(title).60B-%(id)s.%(ext)s"), "restrictfilenames": True,
+            "max_filesize": limit, "merge_output_format": "mp4",
             "match_filter": yt_dlp.utils.match_filter_func(f"duration <=? {MAX_MIN * 60} & !is_live"),
             "progress_hooks": [hook], "postprocessor_hooks": [pp], "concurrent_fragment_downloads": 4}
-    if r.playlist:
-        opts["ignoreerrors"] = "only_download"  # one bad video shouldn't kill the rest
     if q in ("mp3", "m4a"):
-        opts["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": q, "preferredquality": "128" if r.saver else "192"}]
+        opts["postprocessors"] = [{"key": "FFmpegExtractAudio", "preferredcodec": q, "preferredquality": "192"}]
     try:
+        while not got_slot:  # wait for a free download slot
+            got_slot = SLOTS.acquire(timeout=1)
+            if J.get("cancel"):
+                stop("Cancelled.")
+        d.mkdir(exist_ok=True)
+        J.update(status="downloading")
         with yt_dlp.YoutubeDL(opts) as y:
             info = y.extract_info(url) or {}
-        files = sorted(p for p in d.iterdir() if p.is_file() and p.suffix not in (".part", ".ytdl", ".temp"))
+        files = sorted(p for p in d.iterdir() if p.is_file() and not re.search(r"\.(part(-Frag\d+)?|ytdl|temp)$", p.name))
         if not files:
-            raise UserError(f"Nothing downloaded. Check the {MAX_MIN} min / {MAX_MB} MB limits.")
-        if len(files) > 1:  # media is already compressed: store, don't deflate
+            raise UserError(f"Nothing downloaded. The video may be longer than {MAX_MIN} min or larger than {MAX_MB} MB.")
+        if len(files) > 1:
             f = d / "playlist.zip"
-            with zipfile.ZipFile(f, "w", zipfile.ZIP_STORED) as z:
+            with zipfile.ZipFile(f, "w", zipfile.ZIP_STORED, allowZip64=True) as zf:  # stored: no CPU/battery wasted
                 for p in files:
-                    z.write(p, p.name)
+                    zf.write(p, p.name)
             for p in files:
                 p.unlink()
             name = "GrabIt-playlist.zip"
         else:
             f = files[0]
-            name = safe(info.get("title") or "video") + f.suffix
-        if f.stat().st_size > MAX_MB * 1_000_000:
+            name = f.name if info.get("_type") == "playlist" else safe(info.get("title") or "video") + f.suffix
+        size = f.stat().st_size
+        if size > limit:
             raise UserError(f"File is larger than the {MAX_MB} MB limit.")
-        J.update(status="done", percent=100, file=str(f), name=name, bytes=f.stat().st_size, done_at=time.time())
-    except DownloadCancelled:
-        J.update(status="error", error="Cancelled.", done_at=time.time())
+        now = time.time()
+        J.update(status="done", percent=100, file=str(f), name=name, size=size, done_at=now, touch=now)
     except UserError as e:
         J.update(status="error", error=str(e), done_at=time.time())
     except Exception as e:
-        log.warning("download failed: %s", e)
-        J.update(status="error", error=friendly(e), done_at=time.time())
-
-
-def run(jid, url, r):
-    J = JOBS[jid]
-    while not SLOT.acquire(timeout=1):  # queued behind other downloads
-        if J.get("cancel"):
-            return J.update(status="error", error="Cancelled.", done_at=time.time())
-    try:
-        J["status"] = "starting"
-        work(jid, url, r)
+        if J.get("abort"):
+            J.update(status="error", error=J["abort"], done_at=time.time())
+        else:
+            log.warning("download failed (%s)", type(e).__name__)
+            J.update(status="error", error=friendly(e), done_at=time.time())
     finally:
-        SLOT.release()
+        if got_slot:
+            SLOTS.release()
 
 
 async def janitor():
     while True:
-        await asyncio.sleep(60)
+        await asyncio.sleep(30)
         now = time.time()
         for jid, J in list(JOBS.items()):
-            if J.get("done_at") and now - J["done_at"] > TTL:
-                shutil.rmtree(J["dir"], ignore_errors=True)
-                JOBS.pop(jid, None)
-                for k in [k for k, v in KEYS.items() if v == jid]:
-                    KEYS.pop(k, None)
-            elif not J.get("done_at") and now - J["t0"] > 7200:
-                J["cancel"] = True  # stuck job watchdog
-        for u in [u for u, (t, _) in INFO.items() if now - t > 300]:
-            INFO.pop(u, None)
-        for k in [k for k, (t, _) in RAW.items() if now - t > 300]:
-            RAW.pop(k, None)
-        for k, T in list(STREAMS.items()):
-            if T.get("closed") or (not T.get("used") and now - T["t0"] > 120):
-                STREAMS.pop(k, None)
-            elif T.get("used") and now - T["act"] > 60:
-                T["kill"]()  # client left or stalled: stop yt-dlp/ffmpeg
+            if J["status"] in ("done", "error"):
+                if now - max(J.get("done_at") or 0, J.get("touch") or 0) > TTL:
+                    await asyncio.to_thread(shutil.rmtree, J["dir"], True)
+                    JOBS.pop(jid, None)
+            elif now - (J.get("touch") or now) > ABANDON and not J.get("cancel"):
+                J["abort"] = "Stopped because the app was closed for 10 minutes. Tap Try again."
+                J["cancel"] = True
         for ip in list(HITS):
             if not HITS[ip] or HITS[ip][-1] < now - 60:
                 HITS.pop(ip, None)
 
 
 async def updater():
-    while AUTO_UPDATE:  # daily yt-dlp upgrade; restart (when idle) to load it
+    while True:  # daily yt-dlp upgrade; restart (when idle) to load it
         await asyncio.sleep(86400)
         before = yt_dlp.version.__version__
-        pip = [sys.executable, "-m", "pip", "install", "--user", "-q", "-U", "yt-dlp[default]"]
-        await asyncio.to_thread(subprocess.run, pip, capture_output=True)
+        await asyncio.to_thread(subprocess.run, [sys.executable, "-m", "pip", "install", "-U", "yt-dlp"], capture_output=True)
         out = await asyncio.to_thread(subprocess.run, [sys.executable, "-c", "import yt_dlp.version as v;print(v.__version__)"], capture_output=True, text=True)
-        busy = any(not j.get("done_at") for j in JOBS.values())
+        busy = any(j["status"] in ("queued", "downloading", "processing") for j in JOBS.values())
         if out.stdout.strip() not in ("", before) and not busy:
-            os.kill(os.getpid(), signal.SIGTERM)  # platform restarts the container
+            try:  # re-run the same command in place (works in Termux and Docker; no supervisor needed)
+                os.execv(sys.executable, [sys.executable, *sys.orig_argv[1:]])
+            except Exception as e:
+                log.warning("restart after upgrade failed (%s); restart GrabIt by hand", type(e).__name__)
 
 
 @asynccontextmanager
@@ -325,22 +303,40 @@ async def life(app):
 
 
 app = FastAPI(lifespan=life, docs_url=None, redoc_url=None)
-CSP = "default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline'; frame-ancestors 'none'"
 
 
-@app.middleware("http")
-async def guard(request: Request, call_next):
-    if request.method == "POST" and request.url.path in ("/api/info", "/api/download", "/api/prepare"):
-        ip = request.client.host  # uvicorn --proxy-headers already resolves the real client; never trust raw X-Forwarded-For
-        q, now = HITS[ip], time.time()
-        while q and now - q[0] > 60:
-            q.popleft()
-        if len(q) >= RATE:
-            return JSONResponse({"detail": "Too many requests. Wait a minute."}, status_code=429)
-        q.append(now)
-    r = await call_next(request)
-    r.headers.update({"X-Content-Type-Options": "nosniff", "Referrer-Policy": "no-referrer", "Content-Security-Policy": CSP})
-    return r
+class Guard:
+    """Rate limit for POST /api/* plus basic security headers. Plain ASGI, so file streaming stays fast."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        path = scope["path"]
+        if scope["method"] == "POST" and path.startswith("/api/") and not path.startswith("/api/cancel/"):
+            h = {k.decode("latin-1"): v.decode("latin-1") for k, v in scope["headers"]}
+            ip = h.get("cf-connecting-ip") or (scope.get("client") or ("?",))[0]
+            q, now = HITS[ip], time.time()
+            while q and now - q[0] > 60:
+                q.popleft()
+            if len(q) >= RATE:
+                wait = int(60 - (now - q[0])) + 1
+                res = JSONResponse({"detail": f"Too many requests. Wait {wait} seconds and try again."}, status_code=429)
+                return await res(scope, receive, send)
+            q.append(now)
+
+        async def snd(m):
+            if m["type"] == "http.response.start":
+                m["headers"] = [*m.get("headers", []), (b"x-content-type-options", b"nosniff"),
+                                (b"referrer-policy", b"no-referrer")]
+            await send(m)
+
+        await self.app(scope, receive, snd)
+
+
+app.add_middleware(Guard)
 
 
 @app.post("/api/info")
@@ -353,183 +349,100 @@ async def info(r: Req):
 
 @app.post("/api/download")
 async def download(r: Req):
-    if not re.fullmatch(r"v(2160|1440|1080|720|480|360|240)|mp3|m4a", r.quality):
+    if not re.fullmatch(r"v\d{3,4}|best|mp3|m4a", r.quality):
         raise HTTPException(400, "Invalid quality.")
     try:
         url = await asyncio.to_thread(check_url, r.url)
     except UserError as e:
         raise HTTPException(400, str(e))
-    key = (url, r.quality, r.playlist, r.saver)
-    old = JOBS.get(KEYS.get(key))
-    if old and old["status"] != "error":  # same request already running or finished: reuse, no second download
-        return {"job_id": KEYS[key]}
-    if sum(1 for j in JOBS.values() if not j.get("done_at")) >= 30:
-        raise HTTPException(503, "Server is busy. Try again soon.")
+    if sum(1 for j in JOBS.values() if j["status"] in ("queued", "downloading", "processing")) >= 8:
+        raise HTTPException(429, "GrabIt is busy with other downloads. Try again in a minute.")
+    free = shutil.disk_usage(ROOT).free // 1_000_000
+    if free < MIN_FREE_MB:
+        raise HTTPException(507, f"The phone is almost out of storage ({free} MB free). Free some space and try again.")
     jid = uuid.uuid4().hex
-    JOBS[jid] = {"status": "queued", "percent": 0, "dir": ROOT / jid, "t0": time.time()}
-    KEYS[key] = jid
+    JOBS[jid] = {"status": "queued", "percent": 0, "dir": ROOT / jid, "touch": time.time()}
     threading.Thread(target=run, args=(jid, url, r), daemon=True).start()
     return {"job_id": jid}
 
 
+@app.get("/api/status/{jid}")
+async def status(jid: str):
+    J = JOBS.get(jid)
+    if not J:
+        raise HTTPException(404, "This download expired or the server restarted.")
+    J["touch"] = time.time()
+    out = {k: J.get(k) for k in ("status", "percent", "speed", "eta", "error", "name", "size")}
+    return JSONResponse(out, headers={"Cache-Control": "no-store"})
+
+
 @app.post("/api/cancel/{jid}")
-def cancel(jid: str):
-    if jid in JOBS:
-        JOBS[jid]["cancel"] = True
+async def cancel(jid: str):
+    J = JOBS.get(jid)
+    if J and J["status"] not in ("done", "error"):
+        J["abort"] = "Cancelled."
+        J["cancel"] = True
     return {"ok": True}
 
 
-@app.get("/api/progress/{jid}")
-async def progress(jid: str):
-    if jid not in JOBS:
-        raise HTTPException(404, "Unknown job.")
-
-    async def gen():
-        last, idle = None, 0
-        while True:
-            J = JOBS.get(jid)
-            if not J:
-                yield 'data: {"status":"error","error":"Download expired."}\n\n'
-                return
-            d = {k: J.get(k) for k in ("status", "error", "name", "bytes", "speed", "eta")}
-            d["percent"] = int(J.get("percent") or 0)
-            if (d["status"], d["percent"]) != last:  # only send on change: less chatter on mobile data
-                last, idle = (d["status"], d["percent"]), 0
-                yield "data: " + json.dumps(d) + "\n\n"
-            elif idle >= 20:
-                idle = 0
-                yield ": ping\n\n"
-            if d["status"] in ("done", "error"):
-                return
-            idle += 1
-            await asyncio.sleep(0.8)
-
-    return StreamingResponse(gen(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
-
-
-@app.get("/api/file/{jid}")
-def file(jid: str):
+@app.api_route("/api/file/{jid}", methods=["GET", "HEAD"])
+def file(jid: str, request: Request):
     J = JOBS.get(jid)
     if not J or J["status"] != "done":
-        raise HTTPException(404, "File not ready or expired.")
-    J["done_at"] = time.time()  # keep alive while it's being fetched; Range requests let a dropped download resume instead of restarting
-    return FileResponse(J["file"], filename=J["name"])
-
-
-# ---------- direct-to-Chrome streaming: no server-side wait, bytes flow into Chrome's own download ----------
-YT = [sys.executable, "-m", "yt_dlp", "-q", "--no-warnings", "--no-playlist", "-o", "-"] + (
-    [] if GENERIC else ["--allowed-extractors", "default", "--allowed-extractors", "-generic"])
-MIME = {"video": "video/mp4", "m4a": "audio/mp4", "mp3": "audio/mpeg"}
-
-
-def ffcmd(T, rs):  # fragmented MP4 is the only MP4 a pipe can carry (no seeking back to write the header)
-    c = ["ffmpeg", "-loglevel", "error", "-nostdin"]
-    for r in rs:
-        c += ["-i", f"pipe:{r}"]
-    k = T["kind"]
-    if k == "video":
-        c += ["-map", "0:v:0", "-map", "1:a:0" if len(rs) > 1 else "0:a:0?", "-c", "copy",
-              "-movflags", "frag_keyframe+empty_moov+default_base_moof", "-f", "mp4"]
-    elif k == "mp3":
-        c += ["-vn", "-c:a", "libmp3lame", "-b:a", "128k" if T["saver"] else "192k", "-f", "mp3"]
-    else:
-        c += ["-vn", "-c:a"] + (["copy"] if T["aac"] else ["aac", "-b:a", "128k"]) + [
-            "-movflags", "empty_moov+default_base_moof+frag_keyframe", "-frag_duration", "5000000", "-f", "mp4"]
-    return c + ["pipe:1"]
-
-
-@app.post("/api/prepare")
-async def prepare(r: Req):
-    if not re.fullmatch(r"v(2160|1440|1080|720|480|360|240)|mp3|m4a", r.quality) or r.playlist:
-        raise HTTPException(400, "Invalid quality.")
+        return PlainTextResponse("This file expired (files are deleted 10 minutes after last use). Go back to GrabIt and download it again.",
+                                 status_code=404, headers={"Content-Disposition": "inline"})
+    p = Path(J["file"])
     try:
-        url = await asyncio.to_thread(check_url, r.url)
-        if url not in RAW:
-            INFO.pop(url, None)
-            await asyncio.to_thread(get_info, r)
-        raw = RAW[url][1]
-    except UserError as e:
-        raise HTTPException(400, str(e))
-    except KeyError:
-        raise HTTPException(400, "Couldn't process that link.")
-    fm, q = raw["fm"], r.quality
-    T = {"url": url, "saver": r.saver, "t0": time.time(), "kind": "video" if q[0] == "v" else q, "aac": True}
-    if q[0] == "v":
-        v, a = pick(fm, int(q[1:]), r.saver)
-        if not v:
-            raise HTTPException(400, "No video stream found.")
-        T["ids"], ext = [v["format_id"]] + ([a["format_id"]] if a else []), "mp4"
-    else:
-        a = pick_a([f for f in fm if f.get("vcodec") == "none" and has(f, "acodec")], r.saver)
-        if not a:
-            raise HTTPException(400, "No audio stream found.")
-        T["ids"], T["aac"], ext = [a["format_id"]], str(a.get("acodec")).startswith("mp4a"), q
-    T["name"] = safe(raw["title"]) + "." + ext
-    tok = uuid.uuid4().hex
-    STREAMS[tok] = T
-    return {"token": tok, "name": T["name"]}
+        st = p.stat()
+    except OSError:
+        return PlainTextResponse("This file is gone. Go back to GrabIt and download it again.",
+                                 status_code=404, headers={"Content-Disposition": "inline"})
+    J["touch"] = time.time()
+    size, name = st.st_size, J["name"]
+    etag = f'"{jid[:12]}-{size}-{int(st.st_mtime)}"'
+    lastmod = formatdate(st.st_mtime, usegmt=True)
 
+    # HTTP Range support: lets Android's download manager pause/resume instead of failing.
+    start, end, code = 0, size - 1, 200
+    rng, ifr = request.headers.get("range", "").strip(), request.headers.get("if-range")
+    m = re.fullmatch(r"bytes=(\d*)-(\d*)", rng) if rng and (not ifr or ifr in (etag, lastmod)) else None
+    if m and (m[1] or m[2]):
+        if m[1]:
+            start = int(m[1])
+            end = min(int(m[2]), size - 1) if m[2] else size - 1
+        else:
+            start, end = max(0, size - int(m[2])), size - 1
+        if start >= size or start > end:
+            return Response(status_code=416, headers={"Content-Range": f"bytes */{size}"})
+        code = 206
+    length = end - start + 1
 
-@app.get("/api/stream/{token}")
-def stream(token: str):
-    T = STREAMS.get(token)
-    if not T or T.get("used"):
-        raise HTTPException(404, "Link expired. Start again.")
-    if not SLOT.acquire(blocking=False):
-        raise HTTPException(503, "Server is busy. Try again soon.")
-    T.update(used=True, act=time.time(), closed=False, lock=threading.Lock())
-    procs, rs = [], []
+    ext = Path(name).suffix
+    plain = re.sub(r"[^A-Za-z0-9._ -]", "", Path(name).stem.encode("ascii", "ignore").decode()).strip() or "video"
+    headers = {
+        "Content-Length": str(length), "Accept-Ranges": "bytes", "ETag": etag, "Last-Modified": lastmod,
+        "Cache-Control": "no-store",
+        "Content-Disposition": f"attachment; filename=\"{plain}{ext}\"; filename*=UTF-8''{quote(name, safe='')}",
+    }
+    if code == 206:
+        headers["Content-Range"] = f"bytes {start}-{end}/{size}"
+    mime = MIME.get(ext.lower(), "application/octet-stream")
+    if request.method == "HEAD":
+        return Response(status_code=code, headers={**headers, "Content-Type": mime})
 
-    def kill():
-        with T["lock"]:
-            if T["closed"]:
-                return
-            T["closed"] = True
-        for p in procs:
-            try:
-                p.kill()
-            except Exception:
-                pass
-        threading.Thread(target=lambda: [p.wait() for p in procs], daemon=True).start()
-        SLOT.release()
-
-    T["kill"] = kill
-    try:
-        for fid in T["ids"]:
-            rd, wr = os.pipe()
-            procs.append(subprocess.Popen(YT + ["-f", fid, T["url"]], stdout=wr, stderr=subprocess.DEVNULL))
-            os.close(wr)
-            rs.append(rd)
-        ff = subprocess.Popen(ffcmd(T, rs), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, pass_fds=rs)
-        procs.append(ff)
-        for rd in rs:
-            os.close(rd)
-        first = ff.stdout.read1(65536)
-    except Exception as e:
-        log.warning("stream failed: %s", e)
-        kill()
-        raise HTTPException(502, "Couldn't start the download.")
-    if not first:
-        kill()
-        raise HTTPException(502, "Couldn't start the download.")
-
-    def gen():
-        sent, cap = len(first), int(MAX_MB * 1.5e6)
-        try:
-            yield first
-            while sent < cap:
-                b = ff.stdout.read1(1 << 16)
+    def chunks():
+        with open(p, "rb") as fh:
+            fh.seek(start)
+            left = length
+            while left > 0:
+                b = fh.read(min(262144, left))
                 if not b:
                     break
-                sent += len(b)
-                T["act"] = time.time()
+                left -= len(b)
+                J["touch"] = time.time()  # keeps the file alive while it is being downloaded
                 yield b
-        finally:
-            kill()
 
-    asc = T["name"].encode("ascii", "ignore").decode().strip() or "video"
-    cd = f"attachment; filename=\"{asc}\"; filename*=UTF-8''{quote(T['name'])}"
-    return StreamingResponse(gen(), media_type=MIME[T["kind"]], headers={"Content-Disposition": cd, "Cache-Control": "no-store"})
+    return StreamingResponse(chunks(), status_code=code, media_type=mime, headers=headers)
 
 
 @app.get("/health")
@@ -537,22 +450,14 @@ def health():
     return {"ok": True, "yt_dlp": yt_dlp.version.__version__}
 
 
-def asset(name, ctype):  # gzip once at startup + ETag: repeat visits cost a ~200-byte 304
-    raw = (HERE / name).read_bytes()
-    gz = gzip.compress(raw, 9)
-    tag = 'W/"%s"' % hashlib.md5(raw).hexdigest()[:16]
-    head = {"ETag": tag, "Cache-Control": "no-cache", "Vary": "Accept-Encoding"}
-
-    def h(request: Request):
-        if tag in request.headers.get("if-none-match", ""):
-            return Response(status_code=304, headers=head)
-        if "gzip" in request.headers.get("accept-encoding", ""):
-            return Response(gz, media_type=ctype, headers={**head, "Content-Encoding": "gzip"})
-        return Response(raw, media_type=ctype, headers=head)
-    return h
+WEB = {"/": ("index.html", "text/html"), "/sw.js": ("sw.js", "text/javascript"),
+       "/manifest.webmanifest": ("manifest.webmanifest", "application/manifest+json"),
+       "/icon.svg": ("icon.svg", "image/svg+xml")}
 
 
-for p, n, t in (("/", "index.html", "text/html"), ("/sw.js", "sw.js", "text/javascript"),
-                ("/manifest.webmanifest", "manifest.webmanifest", "application/manifest+json"),
-                ("/icon.svg", "icon.svg", "image/svg+xml")):
-    app.add_api_route(p, asset(n, t), include_in_schema=False)
+def page(n, t):
+    return lambda: FileResponse(HERE / n, media_type=t, headers={"Cache-Control": "no-cache"})
+
+
+for p, (n, t) in WEB.items():
+    app.add_api_route(p, page(n, t), include_in_schema=False)
