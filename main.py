@@ -2,7 +2,7 @@ import asyncio, gzip, hashlib, ipaddress, json, logging, os, re, shutil, signal,
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 import yt_dlp
 from yt_dlp.utils import DownloadCancelled
@@ -24,6 +24,8 @@ ROOT.mkdir(parents=True)
 JOBS: dict = {}
 KEYS: dict = {}   # (url, quality, playlist, saver) -> job id, so repeat requests reuse the same file
 INFO: dict = {}   # url -> (time, result), spares the origin site repeated lookups
+RAW: dict = {}    # url -> (time, formats), so /api/prepare doesn't re-fetch what /api/info just got
+STREAMS: dict = {}  # one-shot tickets for direct-to-Chrome streaming
 HITS: dict = defaultdict(deque)
 SLOT = threading.BoundedSemaphore(SLOTS)
 log = logging.getLogger("grabit")
@@ -181,6 +183,7 @@ def get_info(r):
         if i.get("formats") and not fm:
             raise UserError(friendly("drm"))
         top = max((res(f) for f in fm if has(f, "vcodec") and f.get("height")), default=0)
+        RAW[url] = (time.time(), {"title": i.get("title") or "video", "fm": fm})
         V, seen = [], set()
         for h in (2160, 1440, 1080, 720, 480, 360, 240):
             if top < h:
@@ -289,6 +292,13 @@ async def janitor():
                 J["cancel"] = True  # stuck job watchdog
         for u in [u for u, (t, _) in INFO.items() if now - t > 300]:
             INFO.pop(u, None)
+        for k in [k for k, (t, _) in RAW.items() if now - t > 300]:
+            RAW.pop(k, None)
+        for k, T in list(STREAMS.items()):
+            if T.get("closed") or (not T.get("used") and now - T["t0"] > 120):
+                STREAMS.pop(k, None)
+            elif T.get("used") and now - T["act"] > 60:
+                T["kill"]()  # client left or stalled: stop yt-dlp/ffmpeg
         for ip in list(HITS):
             if not HITS[ip] or HITS[ip][-1] < now - 60:
                 HITS.pop(ip, None)
@@ -320,7 +330,7 @@ CSP = "default-src 'self'; img-src 'self' data: https:; style-src 'self' 'unsafe
 
 @app.middleware("http")
 async def guard(request: Request, call_next):
-    if request.method == "POST" and request.url.path in ("/api/info", "/api/download"):
+    if request.method == "POST" and request.url.path in ("/api/info", "/api/download", "/api/prepare"):
         ip = request.client.host  # uvicorn --proxy-headers already resolves the real client; never trust raw X-Forwarded-For
         q, now = HITS[ip], time.time()
         while q and now - q[0] > 60:
@@ -404,6 +414,122 @@ def file(jid: str):
         raise HTTPException(404, "File not ready or expired.")
     J["done_at"] = time.time()  # keep alive while it's being fetched; Range requests let a dropped download resume instead of restarting
     return FileResponse(J["file"], filename=J["name"])
+
+
+# ---------- direct-to-Chrome streaming: no server-side wait, bytes flow into Chrome's own download ----------
+YT = [sys.executable, "-m", "yt_dlp", "-q", "--no-warnings", "--no-playlist", "-o", "-"] + (
+    [] if GENERIC else ["--allowed-extractors", "default", "--allowed-extractors", "-generic"])
+MIME = {"video": "video/mp4", "m4a": "audio/mp4", "mp3": "audio/mpeg"}
+
+
+def ffcmd(T, rs):  # fragmented MP4 is the only MP4 a pipe can carry (no seeking back to write the header)
+    c = ["ffmpeg", "-loglevel", "error", "-nostdin"]
+    for r in rs:
+        c += ["-i", f"pipe:{r}"]
+    k = T["kind"]
+    if k == "video":
+        c += ["-map", "0:v:0", "-map", "1:a:0" if len(rs) > 1 else "0:a:0?", "-c", "copy",
+              "-movflags", "frag_keyframe+empty_moov+default_base_moof", "-f", "mp4"]
+    elif k == "mp3":
+        c += ["-vn", "-c:a", "libmp3lame", "-b:a", "128k" if T["saver"] else "192k", "-f", "mp3"]
+    else:
+        c += ["-vn", "-c:a"] + (["copy"] if T["aac"] else ["aac", "-b:a", "128k"]) + [
+            "-movflags", "empty_moov+default_base_moof+frag_keyframe", "-frag_duration", "5000000", "-f", "mp4"]
+    return c + ["pipe:1"]
+
+
+@app.post("/api/prepare")
+async def prepare(r: Req):
+    if not re.fullmatch(r"v(2160|1440|1080|720|480|360|240)|mp3|m4a", r.quality) or r.playlist:
+        raise HTTPException(400, "Invalid quality.")
+    try:
+        url = await asyncio.to_thread(check_url, r.url)
+        if url not in RAW:
+            INFO.pop(url, None)
+            await asyncio.to_thread(get_info, r)
+        raw = RAW[url][1]
+    except UserError as e:
+        raise HTTPException(400, str(e))
+    except KeyError:
+        raise HTTPException(400, "Couldn't process that link.")
+    fm, q = raw["fm"], r.quality
+    T = {"url": url, "saver": r.saver, "t0": time.time(), "kind": "video" if q[0] == "v" else q, "aac": True}
+    if q[0] == "v":
+        v, a = pick(fm, int(q[1:]), r.saver)
+        if not v:
+            raise HTTPException(400, "No video stream found.")
+        T["ids"], ext = [v["format_id"]] + ([a["format_id"]] if a else []), "mp4"
+    else:
+        a = pick_a([f for f in fm if f.get("vcodec") == "none" and has(f, "acodec")], r.saver)
+        if not a:
+            raise HTTPException(400, "No audio stream found.")
+        T["ids"], T["aac"], ext = [a["format_id"]], str(a.get("acodec")).startswith("mp4a"), q
+    T["name"] = safe(raw["title"]) + "." + ext
+    tok = uuid.uuid4().hex
+    STREAMS[tok] = T
+    return {"token": tok, "name": T["name"]}
+
+
+@app.get("/api/stream/{token}")
+def stream(token: str):
+    T = STREAMS.get(token)
+    if not T or T.get("used"):
+        raise HTTPException(404, "Link expired. Start again.")
+    if not SLOT.acquire(blocking=False):
+        raise HTTPException(503, "Server is busy. Try again soon.")
+    T.update(used=True, act=time.time(), closed=False, lock=threading.Lock())
+    procs, rs = [], []
+
+    def kill():
+        with T["lock"]:
+            if T["closed"]:
+                return
+            T["closed"] = True
+        for p in procs:
+            try:
+                p.kill()
+            except Exception:
+                pass
+        threading.Thread(target=lambda: [p.wait() for p in procs], daemon=True).start()
+        SLOT.release()
+
+    T["kill"] = kill
+    try:
+        for fid in T["ids"]:
+            rd, wr = os.pipe()
+            procs.append(subprocess.Popen(YT + ["-f", fid, T["url"]], stdout=wr, stderr=subprocess.DEVNULL))
+            os.close(wr)
+            rs.append(rd)
+        ff = subprocess.Popen(ffcmd(T, rs), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, pass_fds=rs)
+        procs.append(ff)
+        for rd in rs:
+            os.close(rd)
+        first = ff.stdout.read1(65536)
+    except Exception as e:
+        log.warning("stream failed: %s", e)
+        kill()
+        raise HTTPException(502, "Couldn't start the download.")
+    if not first:
+        kill()
+        raise HTTPException(502, "Couldn't start the download.")
+
+    def gen():
+        sent, cap = len(first), int(MAX_MB * 1.5e6)
+        try:
+            yield first
+            while sent < cap:
+                b = ff.stdout.read1(1 << 16)
+                if not b:
+                    break
+                sent += len(b)
+                T["act"] = time.time()
+                yield b
+        finally:
+            kill()
+
+    asc = T["name"].encode("ascii", "ignore").decode().strip() or "video"
+    cd = f"attachment; filename=\"{asc}\"; filename*=UTF-8''{quote(T['name'])}"
+    return StreamingResponse(gen(), media_type=MIME[T["kind"]], headers={"Content-Disposition": cd, "Cache-Control": "no-store"})
 
 
 @app.get("/health")
