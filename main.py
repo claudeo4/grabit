@@ -280,7 +280,7 @@ def run(jid, url, r):
 
 async def janitor():
     while True:
-        await asyncio.sleep(15)
+        await asyncio.sleep(60)
         now = time.time()
         for jid, J in list(JOBS.items()):
             if J.get("done_at") and now - J["done_at"] > TTL:
@@ -295,10 +295,10 @@ async def janitor():
         for k in [k for k, (t, _) in RAW.items() if now - t > 300]:
             RAW.pop(k, None)
         for k, T in list(STREAMS.items()):
-            if T.get("closed"):
+            if T.get("closed") or (not T.get("used") and now - T["t0"] > 120):
                 STREAMS.pop(k, None)
-            elif (not T.get("used") and now - T["t0"] > 60) or (T.get("used") and now - T["act"] > 900):
-                T["kill"]()  # never claimed, or stalled for 15 min: stop yt-dlp/ffmpeg
+            elif T.get("used") and now - T["act"] > 60:
+                T["kill"]()  # client left or stalled: stop yt-dlp/ffmpeg
         for ip in list(HITS):
             if not HITS[ip] or HITS[ip][-1] < now - 60:
                 HITS.pop(ip, None)
@@ -438,68 +438,6 @@ def ffcmd(T, rs):  # fragmented MP4 is the only MP4 a pipe can carry (no seeking
     return c + ["pipe:1"]
 
 
-def launch(T):  # start yt-dlp -> ffmpeg and wait for the first bytes, so failures reach the page instead of Chrome
-    if not SLOT.acquire(blocking=False):
-        raise HTTPException(503, "Server is busy. Try again in a minute.")
-    T.update(closed=False, lock=threading.Lock(), act=time.time())
-    procs, rs, errs = [], [], []
-
-    def kill():
-        with T["lock"]:
-            if T["closed"]:
-                return
-            T["closed"] = True
-        for p in procs:
-            try:
-                p.kill()
-            except Exception:
-                pass
-        threading.Thread(target=lambda: [p.wait() for p in procs], daemon=True).start()
-        SLOT.release()
-
-    T["kill"] = kill
-    timer = threading.Timer(60, kill)  # yt-dlp hung: give up
-    first = b""
-    try:
-        for fid in T["ids"]:
-            rd, wr = os.pipe()
-            rs.append(rd)
-            e = tempfile.TemporaryFile()
-            errs.append(e)
-            procs.append(subprocess.Popen(YT + ["-f", fid, T["url"]], stdout=wr, stderr=e))
-            os.close(wr)
-        e = tempfile.TemporaryFile()
-        errs.append(e)
-        ff = subprocess.Popen(ffcmd(T, rs), stdout=subprocess.PIPE, stderr=e, pass_fds=rs)
-        procs.append(ff)
-        for rd in rs:
-            os.close(rd)
-        rs.clear()
-        timer.start()
-        first = ff.stdout.read1(65536)
-    except Exception as ex:
-        log.warning("stream launch failed: %s", ex)
-    finally:
-        timer.cancel()
-        for rd in rs:
-            try:
-                os.close(rd)
-            except OSError:
-                pass
-    if not first:
-        txt = ""
-        for e in errs:
-            e.seek(0)
-            txt += e.read().decode(errors="ignore")
-        log.warning("stream failed: %s", txt[-600:])
-        timed = T["closed"]
-        kill()
-        msg = "This took too long. Try again." if timed else next(
-            (m for ks, m in ERRORS if any(k in txt.lower() for k in ks)), "Couldn't start this quality. Try another one.")
-        raise HTTPException(502, msg)
-    T["ff"], T["first"] = ff, first
-
-
 @app.post("/api/prepare")
 async def prepare(r: Req):
     if not re.fullmatch(r"v(2160|1440|1080|720|480|360|240)|mp3|m4a", r.quality) or r.playlist:
@@ -527,33 +465,67 @@ async def prepare(r: Req):
             raise HTTPException(400, "No audio stream found.")
         T["ids"], T["aac"], ext = [a["format_id"]], str(a.get("acodec")).startswith("mp4a"), q
     T["name"] = safe(raw["title"]) + "." + ext
-    await asyncio.to_thread(launch, T)
     tok = uuid.uuid4().hex
     STREAMS[tok] = T
     return {"token": tok, "name": T["name"]}
 
 
 @app.get("/api/stream/{token}")
-async def stream(token: str):
+def stream(token: str):
     T = STREAMS.get(token)
-    if not T or T.get("used") or T["closed"]:
+    if not T or T.get("used"):
         raise HTTPException(404, "Link expired. Start again.")
-    T["used"], T["act"] = True, time.time()
-    ff, first = T["ff"], T["first"]
+    if not SLOT.acquire(blocking=False):
+        raise HTTPException(503, "Server is busy. Try again soon.")
+    T.update(used=True, act=time.time(), closed=False, lock=threading.Lock())
+    procs, rs = [], []
 
-    async def gen():  # async generator: Chrome cancelling the download stops yt-dlp/ffmpeg and frees the slot immediately
+    def kill():
+        with T["lock"]:
+            if T["closed"]:
+                return
+            T["closed"] = True
+        for p in procs:
+            try:
+                p.kill()
+            except Exception:
+                pass
+        threading.Thread(target=lambda: [p.wait() for p in procs], daemon=True).start()
+        SLOT.release()
+
+    T["kill"] = kill
+    try:
+        for fid in T["ids"]:
+            rd, wr = os.pipe()
+            procs.append(subprocess.Popen(YT + ["-f", fid, T["url"]], stdout=wr, stderr=subprocess.DEVNULL))
+            os.close(wr)
+            rs.append(rd)
+        ff = subprocess.Popen(ffcmd(T, rs), stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, pass_fds=rs)
+        procs.append(ff)
+        for rd in rs:
+            os.close(rd)
+        first = ff.stdout.read1(65536)
+    except Exception as e:
+        log.warning("stream failed: %s", e)
+        kill()
+        raise HTTPException(502, "Couldn't start the download.")
+    if not first:
+        kill()
+        raise HTTPException(502, "Couldn't start the download.")
+
+    def gen():
         sent, cap = len(first), int(MAX_MB * 1.5e6)
         try:
             yield first
             while sent < cap:
-                b = await asyncio.to_thread(ff.stdout.read1, 1 << 18)
+                b = ff.stdout.read1(1 << 16)
                 if not b:
                     break
                 sent += len(b)
                 T["act"] = time.time()
                 yield b
         finally:
-            T["kill"]()
+            kill()
 
     asc = T["name"].encode("ascii", "ignore").decode().strip() or "video"
     cd = f"attachment; filename=\"{asc}\"; filename*=UTF-8''{quote(T['name'])}"
