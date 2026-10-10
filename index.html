@@ -22,8 +22,10 @@ section[data-v=idle]{flex:1;justify-content:center;align-items:center;gap:26px;p
 .orb{width:176px;height:176px;border-radius:50%;border:0;background:var(--ac);color:#fff;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;font-weight:800;font-size:21px;animation:pulse 2.4s infinite;transition:transform .15s}
 .orb svg{width:44px;height:44px}.orb:active{transform:scale(.94)}
 @keyframes pulse{0%{box-shadow:0 0 0 0 color-mix(in srgb,var(--ac) 55%,transparent)}70%,100%{box-shadow:0 0 0 40px transparent}}
-.field{width:100%}.field input{width:100%;height:56px;border-radius:18px;border:2px solid transparent;background:var(--s1);padding:0 18px;font-size:17px;text-align:center;outline:0}
+.field{width:100%}.field input{width:100%;height:56px;border-radius:18px;border:2px solid transparent;background:var(--s1);padding:0 56px;font-size:17px;text-align:center;outline:0}
 .field input:focus{border-color:var(--ac)}.field input::placeholder{color:var(--mu)}
+.field{position:relative;margin:0 0 14px}#clr{position:absolute;right:8px;top:8px;width:40px;height:40px;border-radius:50%;border:0;background:var(--s2);display:grid;place-items:center}#clr svg{width:18px;height:18px}
+#app:not([data-s=idle]) .field input{text-align:left;padding-left:18px}
 .chip{justify-self:center;align-self:center;color:var(--mint);font-weight:700;font-size:14px;background:color-mix(in srgb,var(--mint) 14%,transparent);padding:6px 14px;border-radius:99px;margin:0;font-variant-numeric:tabular-nums}
 .sk{border-radius:22px;background:linear-gradient(90deg,var(--s1),var(--s2),var(--s1));background-size:200% 100%;animation:sh 1.2s infinite}@keyframes sh{to{background-position:-200% 0}}
 .thumb{margin:0;position:relative;border-radius:22px;overflow:hidden;aspect-ratio:16/9;background:var(--s2)}
@@ -69,10 +71,10 @@ dialog .seg{background:var(--s2)}dialog .seg .on{background:var(--bg)}
 </head><body><div id="app">
 <header><div class="logo"><i><svg viewBox="0 0 24 24" style="width:20px;height:20px"><path d="M12 4v11M7 11l5 5 5-5M6 20h12"/></svg></i>grabit</div>
 <button id="cog" class="ib" aria-label="Settings"><svg viewBox="0 0 24 24"><path d="M4 7h10M18 7h2M4 17h2M10 17h10"/><circle cx="16" cy="7" r="2"/><circle cx="8" cy="17" r="2"/></svg></button></header>
+<div class="field" data-v="idle load ready err"><input id="url" type="url" inputmode="url" enterkeyhint="go" placeholder="or type a link" autocomplete="off" aria-label="Video link"><button id="clr" aria-label="Clear" hidden><svg viewBox="0 0 24 24"><path d="M7 7l10 10M17 7L7 17"/></svg></button></div>
 <main>
 <section data-v="idle">
  <button id="paste" class="orb" aria-label="Paste link"><svg viewBox="0 0 24 24"><rect x="6" y="5" width="12" height="16" rx="3"/><path d="M9 5a3 3 0 0 1 6 0M9 12h6M9 16h4"/></svg>Paste</button>
- <label class="field"><input id="url" type="url" inputmode="url" enterkeyhint="go" placeholder="or type a link" autocomplete="off" aria-label="Video link"></label>
  <p id="tot" class="chip" hidden></p>
 </section>
 <section data-v="load"><div class="sk" style="aspect-ratio:16/9"></div><div class="sk" style="height:26px;width:80%"></div><div class="sk" style="height:42px"></div><div class="sk" style="height:140px"></div></section>
@@ -86,7 +88,7 @@ dialog .seg{background:var(--s2)}dialog .seg .on{background:var(--bg)}
  <div class="ringw"><svg viewBox="0 0 220 220"><circle class="trk" cx="110" cy="110" r="96"/><circle id="ring" class="prg" cx="110" cy="110" r="96" stroke-linecap="round"/></svg>
   <div class="ringc"><div id="pct">0<small>%</small></div></div>
   <svg class="ok" viewBox="0 0 24 24"><path pathLength="1" d="M5 12.5l4.5 4.5L19 7.5"/></svg></div>
- <p id="pt"></p><p id="ptx" class="mu" data-v="dl"></p><p id="won" class="chip" data-v="done"></p>
+ <p id="pt"></p><p id="ptx" class="mu" data-v="dl"></p><p id="won" class="chip" data-v="done"></p><p id="hint" class="mu" data-v="done" style="text-align:center"></p>
  <button id="cancel" class="ghost" data-v="dl">Cancel</button>
 </section>
 <section data-v="err">
@@ -113,7 +115,8 @@ const fmt=n=>!n?'':n>=1e9?(n/1e9).toFixed(1)+' GB':n>=1e7?Math.round(n/1e6)+' MB
 const tm=s=>{if(s==null)return'';s=Math.round(s);const h=s/3600|0,m=(s%3600)/60|0,x=String(s%60).padStart(2,'0');return h?`${h}:${String(m).padStart(2,'0')}:${x}`:`${m}:${x}`};
 const spd=b=>b?(b>=1e6?(b/1e6).toFixed(1)+' MB/s':Math.round(b/1e3)+' KB/s'):'';
 const clean=t=>{t=(t||'').trim();const m=t.match(/https?:\/\/\S+/i);return m?m[0]:/^[\w-]+(\.[\w-]+)+(\/\S*)?$/.test(t)?'https://'+t:''};
-function show(s){view=s;$$('[data-v]').forEach(e=>e.hidden=!e.dataset.v.split(' ').includes(s));$('#app').dataset.s=s;if(s=='ready'&&info)paint();if(s=='idle')totals()}
+function syncClr(){$('#clr').hidden=!$('#url').value}
+function show(s){view=s;syncClr();$$('[data-v]').forEach(e=>e.hidden=!e.dataset.v.split(' ').includes(s));$('#app').dataset.s=s;if(s=='ready'&&info)paint();if(s=='idle')totals()}
 function fail(m,f){$('#em').textContent=m;retryFn=f;show('err')}
 function home(){info=null;job=null;LS.set('job',null);es&&es.close();$('#url').value='';show('idle')}
 function totals(){const t=LS.get('tot',0);$('#tot').hidden=t<5e6;$('#tot').textContent='Saved '+fmt(t)}
@@ -132,7 +135,14 @@ function setMode(m){mode=m;$$('.seg [data-m]').forEach(b=>b.classList.toggle('on
 function paint(){const L=info[mode];$$('.tile').forEach(b=>{const t=L.find(x=>x.id==b.dataset.id);b.classList.toggle('on',t.id==sel);b.querySelector('small').textContent=t.disabled?'Too large':fmt(saver?t.size:t.full)||'—'});
  const t=L.find(x=>x.id==sel);if(!t)return;const d=t.full-t.size;$('#gosz').textContent=fmt(saver?t.size:t.full);$('#go').disabled=false;$('#gain').hidden=!(saver&&t.size&&d>=5e6);$('#gain').textContent='Saves '+fmt(d)}
 function setP(p){$('#ring').style.strokeDashoffset=603.2*(1-p/100);$('#pct').firstChild.nodeValue=Math.round(p)}
-async function start(){const t=info&&info[mode].find(x=>x.id==sel);if(!t)return home();$('#pt').textContent=info.title;setP(0);$('#ptx').textContent='Starting';show('dl');
+async function start(){const t=info&&info[mode].find(x=>x.id==sel);if(!t)return home();if(info.playlist)return startJob(t);
+ const b=$('#go');b.disabled=true;$('#gosz').textContent='…';
+ try{const {token,name}=await api('/api/prepare',{url,quality:sel,saver});
+  const a=document.createElement('a');a.href='/api/stream/'+token;a.download=name;a.hidden=true;document.body.append(a);a.click();a.remove();
+  $('#pt').textContent=info.title;setP(100);show('done');$('#save').hidden=true;$('#hint').textContent='Downloading in Chrome';
+  credit(saver&&t.size?t.full-t.size:0);navigator.vibrate&&navigator.vibrate(18)}
+ catch(e){fail(e.message,start)}finally{b.disabled=false}}
+async function startJob(t){$('#pt').textContent=info.title;setP(0);$('#ptx').textContent='Starting';show('dl');
  try{const {job_id}=await api('/api/download',{url,quality:sel,playlist:info.playlist,saver});
   job={id:job_id,title:info.title,gain:saver&&t.size?Math.max(0,t.full-t.size):0,at:Date.now()};LS.set('job',job);watch(job_id)}catch(e){fail(e.message,start)}}
 function watch(id){es&&es.close();es=new EventSource('/api/progress/'+id);
@@ -142,9 +152,11 @@ function watch(id){es&&es.close();es=new EventSource('/api/progress/'+id);
   else{if(view!='dl'){$('#pt').textContent=job?job.title:'';show('dl')}setP(d.percent);
    $('#ptx').textContent=d.status=='queued'?'Waiting for a free slot':d.status=='processing'?'Finishing':[spd(d.speed),tm(d.eta)].filter(Boolean).join('  ·  ')}};
  es.onerror=()=>{if(es.readyState==2){es.close();LS.set('job',null);fail('This download expired.',info?start:home)}}}
-function finish(id,d){setP(100);const a=$('#save');a.href='/api/file/'+id;a.download=d.name||'';$('#dsz').textContent=fmt(d.bytes);show('done');
+function finish(id,d){setP(100);const a=$('#save');a.href='/api/file/'+id;a.download=d.name||'';$('#dsz').textContent=fmt(d.bytes);show('done');$('#hint').textContent='';
  const g=job&&job.id==id?job.gain:0;$('#won').hidden=!(g>=5e6);$('#won').textContent='Saved '+fmt(g);
  if(g&&!job.c){job.c=1;LS.set('job',job);LS.set('tot',LS.get('tot',0)+g)}navigator.vibrate&&navigator.vibrate(18)}
+function credit(g){g=Math.max(0,g);$('#won').hidden=!(g>=5e6);$('#won').textContent='Saved '+fmt(g);if(g>=5e6)LS.set('tot',LS.get('tot',0)+g)}
+$('#url').addEventListener('input',syncClr);$('#clr').onclick=home;$('#url').addEventListener('focus',e=>setTimeout(()=>e.target.select(),0));
 $('#paste').onclick=async()=>{let t='';try{t=await navigator.clipboard.readText()}catch{}clean(t)?analyze(t):$('#url').focus()};
 $('#url').addEventListener('keydown',e=>e.key=='Enter'&&analyze(e.target.value));
 $('#url').addEventListener('paste',e=>{const t=e.clipboardData&&e.clipboardData.getData('text');if(clean(t)){e.preventDefault();analyze(t)}});
